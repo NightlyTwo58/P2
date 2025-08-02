@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from prophet import Prophet
+import plotly
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
@@ -14,12 +15,20 @@ def get_data(period='3y', interval='1d'):
     ticker = yf.Ticker('UAL')
     df = ticker.history(period=period, interval=interval)
     df = df[['Close', 'Volume']].dropna()
+    income_stmt = ticker.income_stmt
+    net_income_df = income_stmt.loc[['Net Income']].T
+    net_income_df.index = pd.to_datetime(net_income_df.index)
+    net_income_df = net_income_df.resample('D').ffill().rename(columns={'Net Income': 'quarterly_net_income'})
+    df.index = df.index.tz_localize(None)
+    df = df.merge(net_income_df, left_index=True, right_index=True, how='left')
+    df['quarterly_net_income'] = df['quarterly_net_income'].ffill()
     df['MA10'] = df['Close'].rolling(10).mean()
     df['MA50'] = df['Close'].rolling(50).mean()
     df = df.dropna()
+    df['quarterly_eps'] = df['quarterly_net_income'].ffill()
     return df
 
-def prepare_lstm_data(df, feature_cols=['Close', 'Volume', 'MA10', 'MA50'], lookback=20):
+def prepare_lstm_data(df, feature_cols, lookback=20):
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(df[feature_cols])
     X, y = [], []
@@ -63,7 +72,7 @@ def build_and_train_lstm(X, y, epochs, batch_size, patience, checkpoint_path):
     )
     return model, history
 
-def forecast_lstm(model, df, scaler, lookback=20, steps=30, feature_cols=['Close', 'Volume', 'MA10', 'MA50']):
+def forecast_lstm(model, df, scaler, feature_cols, lookback=20, steps=30):
     # Use last sequence to bootstrap forecasts iteratively
     recent = df[feature_cols].iloc[-lookback:].copy()
     scaled_recent = scaler.transform(recent)
@@ -125,7 +134,7 @@ def plot_results(df, lstm_forecast, prophet_series):
     plt.tight_layout()
     plt.show()
 
-def evaluate_lstm(df, model, scaler, lookback=20, feature_cols=['Close', 'Volume', 'MA10', 'MA50']):
+def evaluate_lstm(df, model, scaler, feature_cols, lookback=20):
     # Use last portion of historical data as walk-forward test (simple in-sample evaluation)
     X, y, _ = prepare_lstm_data(df, feature_cols=feature_cols, lookback=lookback)
     preds_scaled = model.predict(X, verbose=0).flatten()
@@ -143,21 +152,21 @@ def main():
     print(df)
     df.index = df.index.tz_localize(None).normalize()
     print(df)
-    feature_cols = ['Close', 'Volume', 'MA10', 'MA50']
-    lookback = 20  # days
+    feature_cols = ['Close', 'Volume', 'MA10', 'MA50', 'quarterly_eps']
+    lookback = 20
 
     # Prepare LSTM data
-    X, y, scaler = prepare_lstm_data(df, feature_cols=feature_cols, lookback=lookback)
-    lstm_model, history = build_and_train_lstm(X, y, 80, 8, 10, "checkpoints/lstm_best.weights.h5")
+    X, y, scaler = prepare_lstm_data(df, feature_cols, lookback=lookback)
+    lstm_model, history = build_and_train_lstm(X, y, 100, 10, 10, "checkpoints/lstm_best.weights.h5")
 
     # Evaluate LSTM on historical
-    mse, actual, preds = evaluate_lstm(df, lstm_model, scaler, lookback=lookback, feature_cols=feature_cols)
+    mse, actual, preds = evaluate_lstm(df, lstm_model, scaler, feature_cols, 20)
     print(f"LSTM in-sample MSE (close price): {mse:.4f}")
 
     # Forecast future steps days with LSTM
-    lstm_forecast = forecast_lstm(lstm_model, df, scaler, lookback=lookback, steps=60, feature_cols=feature_cols)
+    lstm_forecast = forecast_lstm(lstm_model, df, scaler, feature_cols, lookback=lookback, steps=240)
 
-    prophet_model, prophet_forecast = run_prophet(df, periods=30)
+    prophet_model, prophet_forecast = run_prophet(df, periods=240)
 
     plot_results(df, lstm_forecast, prophet_forecast)
 
