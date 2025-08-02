@@ -1,4 +1,4 @@
-![Delta Predictions](DAL_prelim_prediction.jpg)
+![Delta Predictions](DAL_prelim_prediction.png)
 Predictions for the next 240 days of Delta stock (DAL) based on pure volumes and values.
 
 ![Delta Predictions](prelim_prediction_EPS.png)
