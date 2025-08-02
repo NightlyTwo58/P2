@@ -11,22 +11,32 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 
-def get_data(period='3y', interval='1d'):
-    ticker = yf.Ticker('UAL')
-    df = ticker.history(period=period, interval=interval)
-    df = df[['Close', 'Volume']].dropna()
-    income_stmt = ticker.income_stmt
-    net_income_df = income_stmt.loc[['Net Income']].T
-    net_income_df.index = pd.to_datetime(net_income_df.index)
-    net_income_df = net_income_df.resample('D').ffill().rename(columns={'Net Income': 'quarterly_net_income'})
+
+def get_data(ticker_symbol, period='5y', interval='1d'):
+    ticker = yf.Ticker(ticker_symbol)
+    df = ticker.history(period=period, interval=interval)[['Close', 'Volume']].dropna()
     df.index = df.index.tz_localize(None)
-    df = df.merge(net_income_df, left_index=True, right_index=True, how='left')
-    df['quarterly_net_income'] = df['quarterly_net_income'].ffill()
-    df['MA10'] = df['Close'].rolling(10).mean()
-    df['MA50'] = df['Close'].rolling(50).mean()
-    df = df.dropna()
-    df['quarterly_eps'] = df['quarterly_net_income'].ffill()
-    return df
+    #
+    # net_income_df = ticker.quarterly_financials.loc[['Net Income']].T
+    # net_income_df.index = pd.to_datetime(net_income_df.index)
+    # net_income_df = net_income_df.resample('D').ffill().rename(columns={'Net Income': 'quarterly_net_income'})
+    # df = df.merge(net_income_df, left_index=True, right_index=True, how='left')
+    # df['quarterly_net_income'] = df['quarterly_net_income'].ffill().bfill()
+    #
+    # info_metrics = {
+    #     'debtToEquity': 'debt_to_equity',
+    #     'priceToBook': 'price_to_book',
+    #     'grossMargins': 'gross_margin',
+    #     'operatingMargins': 'operating_margin',
+    #     'profitMargins': 'net_margin'
+    # }
+    # info = {alias: ticker.info.get(key) for key, alias in info_metrics.items()}
+    # info_df = pd.DataFrame(info, index=[df.index[0]])
+    # df = df.merge(info_df, left_index=True, right_index=True, how='left').ffill()
+
+    df['MA10'] = df['Close'].rolling(10, min_periods=1).mean()
+    df['MA50'] = df['Close'].rolling(50, min_periods=1).mean()
+    return df.dropna()
 
 def prepare_lstm_data(df, feature_cols, lookback=20):
     scaler = MinMaxScaler()
@@ -106,29 +116,41 @@ def load_lstm(checkpoint_path, X):
     return model
 
 
-def run_prophet(df, periods=30):
+def run_prophet(df, periods):
     prophet_df = df[['Close']].reset_index().rename(columns={'Date': 'ds', 'Close': 'y'})
     m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
     m.fit(prophet_df)
-    future = m.make_future_dataframe(periods=periods, freq='b')  # business days
+    future = m.make_future_dataframe(periods=periods, freq='b')
     forecast = m.predict(future)
     forecast_series = forecast.set_index('ds')['yhat']
     return m, forecast_series
 
-def plot_results(df, lstm_forecast, prophet_series):
+def plot_results(df, lstm_forecast, prophet_series, metrics=None):
     plt.figure(figsize=(14, 6))
-    plt.plot(df['Close'], label='Historical Close', marker='o', linewidth=1)
+
+    close = df['Close']
+    plt.plot(close, label='Historical Close', marker='o', linewidth=1)
 
     last_hist_date = df.index[-1]
     prophet_fit = prophet_series.loc[:last_hist_date]
     prophet_forecast = prophet_series.loc[prophet_series.index > last_hist_date]
-
     plt.plot(prophet_fit, label='Prophet Fit (in-sample)', linestyle=':', alpha=0.7)
     plt.plot(prophet_forecast, label='Prophet Forecast', linestyle='-.')
     plt.plot(lstm_forecast, label='LSTM Forecast', linestyle='--')
-    plt.title('UAL Stock Close: Historical and Forecasts')
+
+    if metrics:
+        for metric in metrics:
+            if metric not in df:
+                continue
+            series = df[metric].dropna()
+            ref_min, ref_max = close.min(), close.max()
+            scaler = MinMaxScaler(feature_range=(ref_min, ref_max))
+            scaled = pd.Series(scaler.fit_transform(series.values.reshape(-1, 1)).flatten(), index=series.index)
+            plt.plot(scaled, label=f'{metric} (scaled)', linewidth=0.5 , linestyle='-.')
+
+    plt.title('Stock Close: Historical and Forecasts')
     plt.xlabel('Date')
-    plt.ylabel('Price (USD)')
+    plt.ylabel('Price (USD) / Scaled Metrics')
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -148,29 +170,35 @@ def evaluate_lstm(df, model, scaler, feature_cols, lookback=20):
     return mse, actual, preds
 
 def main():
-    df = get_data(period='5y')
+    df = get_data('DAL')
+    pd.set_option('display.max_columns', None)
     print(df)
+
     df.index = df.index.tz_localize(None).normalize()
-    print(df)
-    feature_cols = ['Close', 'Volume', 'MA10', 'MA50', 'quarterly_eps']
+    # print(df)
+    # feature_cols = [
+    #     'Close', 'Volume', 'MA10', 'MA50',
+    #     'quarterly_net_income', 'debt_to_equity',
+    #     'price_to_book',
+    #     'gross_margin', 'operating_margin', 'net_margin'
+    # ]
+    feature_cols = [
+        'Close', 'Volume', 'MA10', 'MA50'
+    ]
     lookback = 20
 
-    # Prepare LSTM data
     X, y, scaler = prepare_lstm_data(df, feature_cols, lookback=lookback)
-    lstm_model, history = build_and_train_lstm(X, y, 100, 10, 10, "checkpoints/lstm_best.weights.h5")
+    lstm_model, history = build_and_train_lstm(X, y, 40, 20, 10, "checkpoints/lstm_best.weights.h5")
 
-    # Evaluate LSTM on historical
     mse, actual, preds = evaluate_lstm(df, lstm_model, scaler, feature_cols, 20)
     print(f"LSTM in-sample MSE (close price): {mse:.4f}")
 
-    # Forecast future steps days with LSTM
     lstm_forecast = forecast_lstm(lstm_model, df, scaler, feature_cols, lookback=lookback, steps=240)
 
     prophet_model, prophet_forecast = run_prophet(df, periods=240)
 
-    plot_results(df, lstm_forecast, prophet_forecast)
+    plot_results(df, lstm_forecast, prophet_forecast, ['Volume'])
 
-    # Optionally, show side-by-side last few actual vs predicted for LSTM
     last_dates = df.index[lookback:]
     lstm_eval_df = pd.DataFrame({
         'Actual_Close': actual,
